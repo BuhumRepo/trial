@@ -1,0 +1,18 @@
+name: ArylLabs
+
+on:
+  repository_dispatch:
+    types: [aryllabs-build]
+
+jobs:
+  deploy:
+    uses: aryllabs/build-system/.github/workflows/build.yml@main
+    with:
+      build_id: ${{ github.event.client_payload.build_id }}
+      upload_url: ${{ github.event.client_payload.upload_url }}
+      callback_url: ${{ github.event.client_payload.callback_url }}
+      preview_id: ${{ github.event.client_payload.preview_id }}
+      build_cmd: ${{ github.event.client_payload.build_cmd }}
+      output_dir: ${{ github.event.client_payload.output_dir }}
+      env_vars: ${{ github.event.client_payload.env_vars }}
+    secrets: inherit
