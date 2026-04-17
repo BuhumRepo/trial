@@ -6,13 +6,133 @@ on:
 
 jobs:
   deploy:
-    uses: aryllabs/build-system/.github/workflows/build.yml@main
-    with:
-      build_id: ${{ github.event.client_payload.build_id }}
-      upload_url: ${{ github.event.client_payload.upload_url }}
-      callback_url: ${{ github.event.client_payload.callback_url }}
-      preview_id: ${{ github.event.client_payload.preview_id }}
-      build_cmd: ${{ github.event.client_payload.build_cmd }}
-      output_dir: ${{ github.event.client_payload.output_dir }}
-      env_vars: ${{ github.event.client_payload.env_vars }}
-    secrets: inherit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      BUILD_ID: ${{ github.event.client_payload.build_id }}
+      UPLOAD_URL: ${{ github.event.client_payload.upload_url }}
+      CALLBACK_URL: ${{ github.event.client_payload.callback_url }}
+      PREVIEW_ID: ${{ github.event.client_payload.preview_id }}
+      BUILD_CMD: ${{ github.event.client_payload.build_cmd }}
+      OUTPUT_DIR: ${{ github.event.client_payload.output_dir }}
+      ENV_VARS_JSON: ${{ github.event.client_payload.env_vars }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Detect package manager
+        id: detect-pm
+        run: |
+          if [ -f "pnpm-lock.yaml" ]; then
+            echo "manager=pnpm" >> $GITHUB_OUTPUT
+            echo "install=pnpm install --frozen-lockfile --prefer-offline" >> $GITHUB_OUTPUT
+          elif [ -f "yarn.lock" ]; then
+            echo "manager=yarn" >> $GITHUB_OUTPUT
+            echo "install=yarn install --frozen-lockfile" >> $GITHUB_OUTPUT
+          elif [ -f "package-lock.json" ]; then
+            echo "manager=npm" >> $GITHUB_OUTPUT
+            echo "install=npm ci" >> $GITHUB_OUTPUT
+          elif [ -f "package.json" ]; then
+            echo "manager=npm" >> $GITHUB_OUTPUT
+            echo "install=npm install" >> $GITHUB_OUTPUT
+          else
+            echo "manager=none" >> $GITHUB_OUTPUT
+            echo "install=echo 'No package manager detected'" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup pnpm
+        if: steps.detect-pm.outputs.manager == 'pnpm'
+        uses: pnpm/action-setup@v4
+        with:
+          version: latest
+
+      - name: Inject environment variables
+        if: env.ENV_VARS_JSON != '' && env.ENV_VARS_JSON != '{}'
+        run: |
+          echo "$ENV_VARS_JSON" | jq -r 'to_entries[] | "\(.key)=\(.value)"' >> $GITHUB_ENV 2>/dev/null || true
+
+      - name: Install dependencies
+        if: steps.detect-pm.outputs.manager != 'none'
+        run: ${{ steps.detect-pm.outputs.install }}
+
+      - name: Build
+        run: |
+          BUILD="${BUILD_CMD:-npm run build}"
+          echo "Running: $BUILD"
+          eval "$BUILD"
+
+      - name: Detect output directory
+        id: output
+        run: |
+          DIR="${OUTPUT_DIR:-dist}"
+          if [ ! -d "$DIR" ]; then
+            for d in dist out build .next/standalone public _site; do
+              if [ -d "$d" ]; then
+                DIR="$d"
+                echo "Fallback: using $d"
+                break
+              fi
+            done
+          fi
+          echo "dir=$DIR" >> $GITHUB_OUTPUT
+
+      - name: Verify output exists
+        run: |
+          DIR="${{ steps.output.outputs.dir }}"
+          if [ ! -d "$DIR" ]; then
+            echo "::error::Output directory '$DIR' not found after build."
+            if [ -n "$CALLBACK_URL" ]; then
+              curl -s -X POST "$CALLBACK_URL" \
+                -H "Content-Type: application/json" \
+                -d "{\"buildId\":\"$BUILD_ID\",\"previewId\":\"$PREVIEW_ID\",\"status\":\"failed\",\"error\":\"Output directory not found.\"}" || true
+            fi
+            exit 1
+          fi
+          echo "Output directory: $DIR ($(du -sh "$DIR" | cut -f1))"
+
+      - name: Create ZIP artifact
+        run: |
+          DIR="${{ steps.output.outputs.dir }}"
+          cd "$DIR"
+          zip -r -q "$GITHUB_WORKSPACE/build-output.zip" .
+          echo "ZIP size: $(du -sh "$GITHUB_WORKSPACE/build-output.zip" | cut -f1)"
+
+      - name: Upload to ArylCloud
+        run: |
+          if [ -z "$UPLOAD_URL" ]; then
+            echo "No upload URL provided, skipping."
+            exit 0
+          fi
+          echo "Uploading build artifact..."
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X PUT "$UPLOAD_URL" \
+            -H "Content-Type: application/zip" \
+            --data-binary @build-output.zip \
+            --max-time 300)
+          echo "Upload response: $HTTP_CODE"
+          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+            echo "::error::Upload failed with HTTP $HTTP_CODE"
+            exit 1
+          fi
+
+      - name: Notify ArylLabs (success)
+        if: success()
+        run: |
+          if [ -z "$CALLBACK_URL" ]; then exit 0; fi
+          R2_PATH="labs/$PREVIEW_ID/builds/$BUILD_ID.zip"
+          BRANCH="${{ github.ref_name }}"
+          curl -s -X POST "$CALLBACK_URL" \
+            -H "Content-Type: application/json" \
+            -d "{\"buildId\":\"$BUILD_ID\",\"previewId\":\"$PREVIEW_ID\",\"status\":\"success\",\"r2Path\":\"$R2_PATH\",\"branch\":\"$BRANCH\"}" || true
+
+      - name: Notify ArylLabs (failure)
+        if: failure()
+        run: |
+          if [ -z "$CALLBACK_URL" ]; then exit 0; fi
+          curl -s -X POST "$CALLBACK_URL" \
+            -H "Content-Type: application/json" \
+            -d "{\"buildId\":\"$BUILD_ID\",\"previewId\":\"$PREVIEW_ID\",\"status\":\"failed\",\"error\":\"Build failed. Check GitHub Actions logs.\"}" || true
