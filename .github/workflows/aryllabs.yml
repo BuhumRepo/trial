@@ -31,7 +31,7 @@ jobs:
             echo "install=yarn install --frozen-lockfile" >> $GITHUB_OUTPUT
           elif [ -f "package-lock.json" ]; then
             echo "manager=npm" >> $GITHUB_OUTPUT
-            echo "install=npm ci" >> $GITHUB_OUTPUT
+            echo "install=npm install" >> $GITHUB_OUTPUT
           elif [ -f "package.json" ]; then
             echo "manager=npm" >> $GITHUB_OUTPUT
             echo "install=npm install" >> $GITHUB_OUTPUT
